@@ -1,0 +1,21 @@
+# Logs (the SDK writes here by default)
+logs/
+*.log
+
+# Go build artifacts
+*.test
+*.out
+coverage.out
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+
+# Local environment overrides
+.env
+.env.local
