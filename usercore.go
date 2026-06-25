@@ -17,6 +17,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +29,9 @@ import (
 const (
 	// PermAccess is the implicit permission point each app's middleware enforces.
 	PermAccess = "access"
+
+	// DefaultPermissionsPath is the direct user-core permissions endpoint.
+	DefaultPermissionsPath = "/api/v1/me/permissions"
 
 	ctxKeyUID   = "usercore_uid"
 	ctxKeyEmail = "usercore_email"
@@ -41,6 +45,9 @@ type Client struct {
 	JWTSecret []byte
 	HTTP      *http.Client
 
+	HostHeader      string
+	PermissionsPath string
+
 	cacheTTL time.Duration
 	mu       sync.RWMutex
 	cache    map[string]cacheEntry
@@ -51,20 +58,104 @@ type cacheEntry struct {
 	expiresAt time.Time
 }
 
+// Option customizes a Client during construction.
+type Option func(*Client)
+
 // New constructs a Client with sensible defaults: 5s HTTP timeout, 30s perm cache.
-func New(baseURL, appID, jwtSecret string) *Client {
-	return &Client{
-		BaseURL:   strings.TrimRight(baseURL, "/"),
-		AppID:     appID,
-		JWTSecret: []byte(jwtSecret),
-		HTTP:      &http.Client{Timeout: 5 * time.Second},
-		cacheTTL:  30 * time.Second,
-		cache:     make(map[string]cacheEntry),
+//
+// By default the client talks directly to user-core at /api/v1/me/permissions.
+// Gateway deployments can set USER_CORE_HOST_HEADER and
+// USER_CORE_PERMISSIONS_PATH, or pass WithHostHeader / WithPermissionsPath
+// explicitly. Explicit options win over environment variables.
+func New(baseURL, appID, jwtSecret string, opts ...Option) *Client {
+	c := &Client{
+		BaseURL:         strings.TrimRight(baseURL, "/"),
+		AppID:           appID,
+		JWTSecret:       []byte(jwtSecret),
+		HTTP:            &http.Client{Timeout: 5 * time.Second},
+		PermissionsPath: DefaultPermissionsPath,
+		cacheTTL:        30 * time.Second,
+		cache:           make(map[string]cacheEntry),
 	}
+	WithEnvOptions()(c)
+	for _, opt := range opts {
+		if opt != nil {
+			opt(c)
+		}
+	}
+	return c
 }
 
 // SetCacheTTL overrides the default 30s permission cache TTL.
 func (c *Client) SetCacheTTL(d time.Duration) { c.cacheTTL = d }
+
+// SetHostHeader sets the HTTP Host header used when calling user-core.
+// It is useful when user-core is reached through agenda-gateway routes bound
+// to a public/admin host.
+func (c *Client) SetHostHeader(host string) {
+	c.HostHeader = strings.TrimSpace(host)
+}
+
+// SetPermissionsPath sets the path appended to BaseURL when loading perms.
+// Examples:
+//   - direct user-core: /api/v1/me/permissions
+//   - gateway prefix /user-api with backend path /api/v1: /me/permissions
+func (c *Client) SetPermissionsPath(path string) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	c.PermissionsPath = path
+}
+
+// WithHTTPClient replaces the default HTTP client.
+func WithHTTPClient(client *http.Client) Option {
+	return func(c *Client) {
+		if client != nil {
+			c.HTTP = client
+		}
+	}
+}
+
+// WithCacheTTL overrides the default 30s permission cache TTL.
+func WithCacheTTL(d time.Duration) Option {
+	return func(c *Client) {
+		c.SetCacheTTL(d)
+	}
+}
+
+// WithHostHeader sets the HTTP Host header used when calling user-core.
+func WithHostHeader(host string) Option {
+	return func(c *Client) {
+		c.SetHostHeader(host)
+	}
+}
+
+// WithPermissionsPath sets the path appended to BaseURL when loading perms.
+func WithPermissionsPath(path string) Option {
+	return func(c *Client) {
+		c.SetPermissionsPath(path)
+	}
+}
+
+// WithEnvOptions reads gateway-related SDK options from environment variables.
+//
+// Supported variables:
+//   - USER_CORE_HOST_HEADER
+//   - USER_CORE_PERMISSIONS_PATH
+func WithEnvOptions() Option {
+	return func(c *Client) {
+		if v := os.Getenv("USER_CORE_HOST_HEADER"); v != "" {
+			c.SetHostHeader(v)
+		}
+		if v := os.Getenv("USER_CORE_PERMISSIONS_PATH"); v != "" {
+			c.SetPermissionsPath(v)
+		}
+	}
+}
 
 type sdkClaims struct {
 	UID   string `json:"uid"`
@@ -74,11 +165,11 @@ type sdkClaims struct {
 }
 
 // Middleware returns a Gin middleware that:
-//   1. Parses Authorization: Bearer <jwt>
-//   2. Verifies HS256 with JWTSecret (fails 401 on invalid/expired)
-//   3. Fetches the user's permissions for AppID (with caching)
-//   4. Rejects 403 unless the user has PermAccess in AppID
-//   5. Stores uid, email, and perms in the gin.Context for downstream handlers.
+//  1. Parses Authorization: Bearer <jwt>
+//  2. Verifies HS256 with JWTSecret (fails 401 on invalid/expired)
+//  3. Fetches the user's permissions for AppID (with caching)
+//  4. Rejects 403 unless the user has PermAccess in AppID
+//  5. Stores uid, email, and perms in the gin.Context for downstream handlers.
 func (c *Client) Middleware() gin.HandlerFunc {
 	return func(g *gin.Context) {
 		auth := g.GetHeader("Authorization")
@@ -166,12 +257,18 @@ func (c *Client) fetchPerms(ctx context.Context, uid, bearer string) (map[string
 	}
 	c.mu.RUnlock()
 
-	u := c.BaseURL + "/api/v1/me/permissions?app=" + url.QueryEscape(c.AppID)
+	u, err := c.permissionsURL()
+	if err != nil {
+		return nil, err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+bearer)
+	if c.HostHeader != "" {
+		req.Host = c.HostHeader
+	}
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return nil, err
@@ -198,6 +295,33 @@ func (c *Client) fetchPerms(ctx context.Context, uid, bearer string) (map[string
 	c.cache[uid] = cacheEntry{perms: m, expiresAt: time.Now().Add(c.cacheTTL)}
 	c.mu.Unlock()
 	return m, nil
+}
+
+func (c *Client) permissionsURL() (string, error) {
+	u, err := url.Parse(c.BaseURL)
+	if err != nil {
+		return "", err
+	}
+	u.Path = joinURLPath(u.Path, c.PermissionsPath)
+	q := u.Query()
+	q.Set("app", c.AppID)
+	u.RawQuery = q.Encode()
+	return u.String(), nil
+}
+
+func joinURLPath(basePath, childPath string) string {
+	basePath = strings.TrimRight(strings.TrimSpace(basePath), "/")
+	childPath = strings.TrimLeft(strings.TrimSpace(childPath), "/")
+	if childPath == "" {
+		if basePath == "" {
+			return "/"
+		}
+		return basePath
+	}
+	if basePath == "" {
+		return "/" + childPath
+	}
+	return basePath + "/" + childPath
 }
 
 func abortJSON(g *gin.Context, status int, code, msg string) {
