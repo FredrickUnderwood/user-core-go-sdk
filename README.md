@@ -37,46 +37,60 @@ func createTaskHandler(c *gin.Context) {
 For gateway routes like:
 
 ```text
-Host=admin.snapcoach.cn
+Host=api.snapcoach.cn
 Path=/user-api
 Strip=true
 Backend Path=/api/v1
 ```
 
-configure the SDK as:
+configure only the user-core gateway base URL:
 
 ```go
 uc := usercore.New(
-    "http://agenda-gateway:8080/user-api",
+    "https://api.snapcoach.cn/user-api",
     "data-platform",
     cfg.UserCore.JWTSecret,
-    usercore.WithHostHeader("admin.snapcoach.cn"),
-    usercore.WithPermissionsPath("/me/permissions"),
 )
 ```
 
-Old services that already call `usercore.New(...)` can use environment
-variables instead:
+Or via environment in downstream services:
 
 ```bash
-export USER_CORE_BASE_URL='http://agenda-gateway:8080/user-api'
-export USER_CORE_HOST_HEADER='admin.snapcoach.cn'
-export USER_CORE_PERMISSIONS_PATH='/me/permissions'
+export USER_CORE_BASE_URL='https://api.snapcoach.cn/user-api'
+```
+
+The SDK appends `/me/permissions`, so the request becomes
+`https://api.snapcoach.cn/user-api/me/permissions?app={AppID}`. The gateway
+route then rewrites it to user-core's internal `/api/v1/me/permissions`.
+
+`WithHostHeader` and `USER_CORE_HOST_HEADER` remain available for special
+internal routes, but a real gateway domain is preferred because the HTTP Host
+comes from the base URL naturally.
+
+For direct user-core access, opt in explicitly:
+
+```go
+uc := usercore.New(
+    "http://user-core:8082",
+    "data-platform",
+    cfg.UserCore.JWTSecret,
+    usercore.WithDirectUserCore(),
+)
 ```
 
 ## What it does
 
 1. Parses `Authorization: Bearer <jwt>`.
 2. Verifies HS256 locally with the shared `JWTSecret` (no remote call).
-3. `GET {BaseURL}{PermissionsPath}?app={AppID}` (forwarding the bearer) to load permissions.
+3. `GET {BaseURL}/me/permissions?app={AppID}` (forwarding the bearer) to load permissions.
 4. Caches permissions in-memory for 30s per uid (configurable via `SetCacheTTL`).
 5. Aborts 403 if the user lacks `access` in this app; otherwise puts uid/email/perms into the gin context.
 
 The cache means a freshly revoked permission keeps working for up to 30s downstream.
 
-Defaults remain backward compatible:
+Gateway-first defaults:
 
 ```text
-PermissionsPath=/api/v1/me/permissions
+PermissionsPath=/me/permissions
 HostHeader=
 ```

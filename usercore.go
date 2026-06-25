@@ -2,7 +2,7 @@
 //
 // Typical use in a downstream Gin service:
 //
-//	uc := usercore.New("http://user-core:8082", "agenda", cfg.UserCore.JWTSecret)
+//	uc := usercore.New("https://api.snapcoach.cn/user-api", "agenda", cfg.UserCore.JWTSecret)
 //	v1 := r.Group("/api/v1")
 //	v1.Use(uc.Middleware())                            // requires logged-in user with `access`
 //	v1.POST("/tasks", uc.RequirePerm("task.create"), createTask)
@@ -30,8 +30,14 @@ const (
 	// PermAccess is the implicit permission point each app's middleware enforces.
 	PermAccess = "access"
 
-	// DefaultPermissionsPath is the direct user-core permissions endpoint.
-	DefaultPermissionsPath = "/api/v1/me/permissions"
+	// DefaultPermissionsPath is appended to a gateway base URL that already
+	// contains the user-core route prefix, for example
+	// https://api.snapcoach.cn/user-api.
+	DefaultPermissionsPath = "/me/permissions"
+
+	// DirectPermissionsPath is the direct user-core permissions endpoint.
+	// Prefer the default gateway path for new deployments.
+	DirectPermissionsPath = "/api/v1/me/permissions"
 
 	ctxKeyUID   = "usercore_uid"
 	ctxKeyEmail = "usercore_email"
@@ -63,10 +69,11 @@ type Option func(*Client)
 
 // New constructs a Client with sensible defaults: 5s HTTP timeout, 30s perm cache.
 //
-// By default the client talks directly to user-core at /api/v1/me/permissions.
-// Gateway deployments can set USER_CORE_HOST_HEADER and
-// USER_CORE_PERMISSIONS_PATH, or pass WithHostHeader / WithPermissionsPath
-// explicitly. Explicit options win over environment variables.
+// By default the client talks to user-core through an API gateway base URL,
+// such as https://api.snapcoach.cn/user-api, and appends /me/permissions.
+// Direct user-core deployments can pass WithDirectUserCore or
+// WithPermissionsPath(DirectPermissionsPath). Explicit options win over
+// environment variables.
 func New(baseURL, appID, jwtSecret string, opts ...Option) *Client {
 	c := &Client{
 		BaseURL:         strings.TrimRight(baseURL, "/"),
@@ -139,6 +146,12 @@ func WithPermissionsPath(path string) Option {
 	return func(c *Client) {
 		c.SetPermissionsPath(path)
 	}
+}
+
+// WithDirectUserCore uses the direct user-core /api/v1 permissions endpoint.
+// New deployments should normally route through a gateway base URL instead.
+func WithDirectUserCore() Option {
+	return WithPermissionsPath(DirectPermissionsPath)
 }
 
 // WithEnvOptions reads gateway-related SDK options from environment variables.
